@@ -6,9 +6,7 @@ The implementation is based on torch-splatting: https://github.com/hbb1/torch-sp
 
 from jaxtyping import Bool, Float, jaxtyped
 import torch
-from textdistance.algorithms.vector_based import Mahalanobis
 from typeguard import typechecked
-from zmq.backend.cffi import device
 
 from .camera import Camera
 from .scene import Scene
