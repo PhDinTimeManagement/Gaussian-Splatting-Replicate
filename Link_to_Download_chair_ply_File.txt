@@ -1,0 +1,3 @@
+Due to the chair.ply file size is larger than 100 MB, which cannot be pushed to GitHub. So we need to download the specific file through following link.
+
+https://drive.google.com/drive/folders/1U4meVGaYqIFF0W6BxDdylooCOpICI9cx?usp=sharing
