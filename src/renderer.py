@@ -6,8 +6,9 @@ The implementation is based on torch-splatting: https://github.com/hbb1/torch-sp
 
 from jaxtyping import Bool, Float, jaxtyped
 import torch
+from textdistance.algorithms.vector_based import Mahalanobis
 from typeguard import typechecked
-
+from zmq.backend.cffi import device
 
 from .camera import Camera
 from .scene import Scene
@@ -137,11 +138,26 @@ class GSRasterizer(object):
         """
         # ========================================================
         # TODO: Implement the projection to NDC space
-        p_ndc = None
-        p_view = None
+        # 1) Make homogeneous (Nx4)
+        p_world_h = homogenize(points)          # [N, 4]
+
+        # 2) World to camera space
+        p_view = p_world_h @ w2c                # [N, 4]
+
+        # 3) Camera to clip space
+        p_clip = p_view @ proj_mat              # [N, 4]
+
+        # 4) Perspective divide to get NDC
+        w = p_clip[:, 3:4]                      # [N, 1]
+        # Avoid division by zero
+        eps = torch.tensor(1e-6, device=w.device, dtype=w.dtype)
+        w_safe = torch.where(w == 0, eps, w)
+        p_ndc = p_clip / w_safe                  # [N, 4]
 
         # TODO: Cull points that are close or behind the camera
-        in_mask = None
+        # 5) Mask out points that are behind the near plane
+        # Camera looks along +z, so z_view > z_near is in front of the camera
+        in_mask = p_view[:, 2] > z_near         # [N]
         # ========================================================
 
         return p_ndc, p_view, in_mask
@@ -166,30 +182,56 @@ class GSRasterizer(object):
         Projects 3D covariances to 2D image plane.
 
         Args:
-        - mean_3d: Coordinates of center of 3D Gaussians.
-        - cov_3d: 3D covariance matrix.
-        - w2c: World-to-camera matrix.
+        - mean_3d: Coordinates of center of 3D Gaussians.       # [Nx3]
+        - cov_3d: 3D covariance matrix.                         # [Nx3x3]
+        - w2c: World-to-camera matrix.                          # [4x4]
         - f_x: Focal length along x-axis.
         - f_y: Focal length along y-axis.
 
         Returns:
-        - cov_2d: 2D covariance matrix.
+        - cov_2d: 2D covariance matrix.                         # [Nx2x2]
         """ 
         # ========================================================
         # TODO: Transform 3D mean coordinates to camera space
         # ========================================================
 
         # Transpose the rigid transformation part of the world-to-camera matrix
-        J = torch.zeros(mean_3d.shape[0], 3, 3).to(mean_3d)
-        W = w2c[:3, :3].T
+
+        # 1) Compute Jacobian J for each Gaussian
+        # Make a batch-homogeneous view-space point
+        p_view_h = homogenize(mean_3d) @ w2c                                # [N, 4]
+        t_x, t_y, t_z = p_view_h[:, 0], p_view_h[:, 1], p_view_h[:, 2]      # [N]
+
+        # Initialize the Jacobian J = zero [Nx3x3]
+        J = torch.zeros(mean_3d.shape[0], 3, 3, device=mean_3d.device, dtype=mean_3d.dtype)
+
+        # fill in according to
+        #   J = [[ f_x/t_z,        0,  -f_x t_x / t_z^2 ],
+        #        [      0,   f_y/t_z,  -f_y t_y / t_z^2 ],
+        #        [      0,        0,               0   ]]
+        J[:, 0, 0] = f_x / t_z
+        J[:, 0, 2] = -f_x * t_x / (t_z * t_z)
+        J[:, 1, 1] = f_y / t_z
+        J[:, 1, 2] = -f_y * t_y / (t_z * t_z)
+        # The rest of the Jacobian is zero
+
+        # 2) Rotate the world-covariance to camera space, then project to 2D
+        # Extract the world-to-camera rotation part
+        W = w2c[:3, :3].T                       # [3x3]
+
+        # Σ_camera = W Σ_3D Wᵀ   →  [N×3×3]
+        cov_cam = W @ cov_3d                    # broadcast W [3×3] over [N×3×3] → [N×3×3]
+        cov_cam = cov_cam @ W.T                 # [N×3×3] @ [3×3] → [N×3×3]
+
         # ========================================================
         # TODO: Compute Jacobian of view transform and projection
-        cov_2d = None
+        # Σ_2D = J Σ_camera Jᵀ  →  [N×3×3]
+        cov_2d = J @ cov_cam @ J.permute(0, 2, 1)
         # ========================================================
 
         # add low pass filter here according to E.q. 32
-        filter = torch.eye(2, 2).to(cov_2d) * 0.3
-        return cov_2d[:, :2, :2] + filter[None]
+        filt = torch.eye(2, device=cov_2d.device, dtype=cov_2d.dtype) * 0.3
+        return cov_2d[:, :2, :2] + filt[None]
 
     @jaxtyped(typechecker=typechecked)
     @torch.no_grad()
@@ -228,21 +270,49 @@ class GSRasterizer(object):
                 # ========================================================
                 # TODO: Sort the projected Gaussians that lie in the current tile by their depths, in ascending order
                 # ========================================================
-                
+                # 1) Sort the overlapping Gaussians by ascending depth
+                idxs = torch.nonzero(in_mask, as_tuple=False).squeeze(-1)           # [M]
+                depths_tile = depths[idxs]                                          # [M]
+                _, order = torch.sort(depths_tile, descending=False)
+                idxs = idxs[order]                                                  # [M]
+
                 # ========================================================
                 # TODO: Compute the displacement vector from the 2D mean coordinates to the pixel coordinates
                 # ========================================================
+                # 2) Build displacement vectors d_{i,j} for each pixel in the tile
+                tile_pix = pix_coord[h:h+self.tile_size, w:w+self.tile_size]       # [tile_size, tile_size, 2]
+                tile_flat = tile_pix.reshape(-1, 2)                                # [T², 2]
+                # Broadcast the center coordinates of the Gaussians to the tile
+                d_ij = tile_flat[None, :, :] - mean_2d[idxs][:, None, :]            # [M, T², 2]
 
                 # ========================================================
                 # TODO: Compute the Gaussian weight for each pixel in the tile
                 # ========================================================
+                # 3) Compute Gaussian weights w_{i,j}
+                cov_inv = torch.inverse(cov_2d[idxs])                           # [M, 2, 2]
+                # Mahalanobis (d @ Σ⁻¹ @ dᵀ)
+                u = cov_inv.unsqueeze(1) @ d_ij.unsqueeze(-1)                   # [M, T², 2, 1]
+                quad = (d_ij.unsqueeze(-1) * u).sum(dim=2).squeeze(-1)          # [M, T²]
+                w_ij = torch.exp(-0.5 * quad)                                   # [M, T²]
+                # Modulate by opacity α_j
+                alpha_tilde = w_ij * opacities[idxs].squeeze(-1)[:, None]             # [M, T²]
 
                 # ========================================================
                 # TODO: Perform alpha blending
-                tile_color = None
+                # 4) Front-to-back alpha blending
+                T_acc = torch.ones(tile_flat.shape[0], device=color.device, dtype=color.dtype)           # [T²]
+                tile_color = torch.zeros(tile_flat.shape[0], 3, device=color.device, dtype=color.dtype)  # [T²×3]
+                for m, j in enumerate(idxs):
+                    a = alpha_tilde[m]                                                                   # [T²]
+                    c_j = color[j]                                                                       # [3]
+                    contrib = (a * T_acc).unsqueeze(-1) * c_j                                            # [T²×3]
+                    tile_color += contrib
+                    T_acc = T_acc * (1.0 - a)
                 # ========================================================
 
-                render_color[h:h+self.tile_size, w:w+self.tile_size] = tile_color.reshape(self.tile_size, self.tile_size, -1)
+                render_color[h:h+self.tile_size,
+                             w:w+self.tile_size
+                ] = tile_color.reshape(self.tile_size, self.tile_size, 3)
 
         return render_color
 
