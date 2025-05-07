@@ -136,7 +136,7 @@ class GSRasterizer(object):
         """
         # ========================================================
         # TODO: Implement the projection to NDC space
-        # 1) Make homogeneous (Nx4)
+        # 1) Make homogeneous
         p_world_h = homogenize(points)          # [N, 4]
 
         # 2) World to camera space
@@ -200,10 +200,13 @@ class GSRasterizer(object):
         p_view_h = homogenize(mean_3d) @ w2c                                # [N, 4]
         t_x, t_y, t_z = p_view_h[:, 0], p_view_h[:, 1], p_view_h[:, 2]      # [N]
 
-        # Initialize the Jacobian J = zero [Nx3x3]
-        J = torch.zeros(mean_3d.shape[0], 3, 3, device=mean_3d.device, dtype=mean_3d.dtype)
+        # Initialize the Jacobian J = zero [N, 3, 3]
+        # J = torch.zeros(mean_3d.shape[0], 3, 3).to(mean_3d)
+        # Run faster
+        J = torch.zeros(mean_3d.shape[0], 3, 3,
+                        device=mean_3d.device,
+                        dtype=mean_3d.dtype)
 
-        # fill in according to
         #   J = [[ f_x/t_z,        0,  -f_x t_x / t_z^2 ],
         #        [      0,   f_y/t_z,  -f_y t_y / t_z^2 ],
         #        [      0,        0,               0   ]]
@@ -215,21 +218,21 @@ class GSRasterizer(object):
 
         # 2) Rotate the world-covariance to camera space, then project to 2D
         # Extract the world-to-camera rotation part
-        W = w2c[:3, :3].T                       # [3x3]
+        W = w2c[:3, :3].T                       # [3, 3]
 
-        # Σ_camera = W Σ_3D Wᵀ   →  [N×3×3]
-        cov_cam = W @ cov_3d                    # broadcast W [3×3] over [N×3×3] → [N×3×3]
-        cov_cam = cov_cam @ W.T                 # [N×3×3] @ [3×3] → [N×3×3]
+        # Σ_camera = W Σ_3D Wᵀ   →  [N, 3, 3]
+        cov_cam = W @ cov_3d                    # broadcast W [3, 3] over [N, 3, 3] → [N, 3, 3]
+        cov_cam = cov_cam @ W.T                 # [N, 3, 3] @ [3, 3] → [N, 3, 3]
 
         # ========================================================
         # TODO: Compute Jacobian of view transform and projection
-        # Σ_2D = J Σ_camera Jᵀ  →  [N×3×3]
+        # Σ_2D = J Σ_camera Jᵀ  →  [N, 3, 3]
         cov_2d = J @ cov_cam @ J.permute(0, 2, 1)
         # ========================================================
 
         # add low pass filter here according to E.q. 32
-        filt = torch.eye(2, 2).to(cov_2d) * 0.3
-        return cov_2d[:, :2, :2] + filt[None]
+        filter = torch.eye(2, 2).to(cov_2d) * 0.3
+        return cov_2d[:, :2, :2] + filter[None]
 
     @jaxtyped(typechecker=typechecked)
     @torch.no_grad()
@@ -299,21 +302,19 @@ class GSRasterizer(object):
                 # TODO: Perform alpha blending
                 # ========================================================
                 # 4) Front-to-back alpha blending
-                T_acc = torch.ones(tile_flat.shape[0], device=color.device, dtype=color.dtype)  # [T²]
-                tile_color = torch.zeros(tile_flat.shape[0], 3, device=color.device, dtype=color.dtype)  # [T²×3]
+                T_acc = torch.ones(tile_flat.shape[0], device=color.device, dtype=color.dtype)              # [T²]
+                tile_color = torch.zeros(tile_flat.shape[0], 3, device=color.device, dtype=color.dtype)     # [T², 3]
                 for m, j in enumerate(idxs):
-                    a = alpha_tilde[m]  # [T²]
-                    c_j = color[j]  # [3]
-                    contrib = (a * T_acc).unsqueeze(-1) * c_j  # [T²×3]
+                    a = alpha_tilde[m]                                                                      # [T²]
+                    c_j = color[j]                                                                          # [3]
+                    contrib = (a * T_acc).unsqueeze(-1) * c_j                                               # [T², 3]
                     tile_color += contrib
                     T_acc = T_acc * (1.0 - a)
 
-                # Add white‐background residual
+                # 5) Add white‐background residual
                 tile_color = tile_color + T_acc.unsqueeze(-1)
 
-                render_color[h:h+self.tile_size,
-                             w:w+self.tile_size
-                ] = tile_color.reshape(self.tile_size, self.tile_size, 3)
+                render_color[h:h+self.tile_size, w:w+self.tile_size] = tile_color.reshape(self.tile_size, self.tile_size, -1)
 
         return render_color
 
