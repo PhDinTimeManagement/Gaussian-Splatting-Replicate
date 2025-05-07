@@ -306,6 +306,9 @@ class GSRasterizer(object):
                     contrib = (a * T_acc).unsqueeze(-1) * c_j                                            # [T²×3]
                     tile_color += contrib
                     T_acc = T_acc * (1.0 - a)
+
+                # Add white‐background residual
+                tile_color = tile_color + T_acc.unsqueeze(-1)
                 # ========================================================
 
                 render_color[h:h+self.tile_size,
