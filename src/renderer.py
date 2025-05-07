@@ -150,7 +150,7 @@ class GSRasterizer(object):
         # Avoid division by zero
         eps = torch.tensor(1e-6, device=w.device, dtype=w.dtype)
         w_safe = torch.where(w == 0, eps, w)
-        p_ndc = p_clip / w_safe                  # [N, 4]
+        p_ndc = p_clip / w_safe                 # [N, 4]
 
         # TODO: Cull points that are close or behind the camera
         # 5) Mask out points that are behind the near plane
@@ -228,7 +228,7 @@ class GSRasterizer(object):
         # ========================================================
 
         # add low pass filter here according to E.q. 32
-        filt = torch.eye(2, device=cov_2d.device, dtype=cov_2d.dtype) * 0.3
+        filt = torch.eye(2, 2).to(cov_2d) * 0.3
         return cov_2d[:, :2, :2] + filt[None]
 
     @jaxtyped(typechecker=typechecked)
@@ -281,7 +281,7 @@ class GSRasterizer(object):
                 tile_pix = pix_coord[h:h+self.tile_size, w:w+self.tile_size]       # [tile_size, tile_size, 2]
                 tile_flat = tile_pix.reshape(-1, 2)                                # [T², 2]
                 # Broadcast the center coordinates of the Gaussians to the tile
-                d_ij = tile_flat[None, :, :] - mean_2d[idxs][:, None, :]            # [M, T², 2]
+                d_ij = tile_flat[None, :, :] - mean_2d[idxs][:, None, :]           # [M, T², 2]
 
                 # ========================================================
                 # TODO: Compute the Gaussian weight for each pixel in the tile
@@ -293,23 +293,23 @@ class GSRasterizer(object):
                 quad = (d_ij.unsqueeze(-1) * u).sum(dim=2).squeeze(-1)          # [M, T²]
                 w_ij = torch.exp(-0.5 * quad)                                   # [M, T²]
                 # Modulate by opacity α_j
-                alpha_tilde = w_ij * opacities[idxs].squeeze(-1)[:, None]             # [M, T²]
+                alpha_tilde = w_ij * opacities[idxs].squeeze(-1)[:, None]       # [M, T²]
 
                 # ========================================================
                 # TODO: Perform alpha blending
+                # ========================================================
                 # 4) Front-to-back alpha blending
-                T_acc = torch.ones(tile_flat.shape[0], device=color.device, dtype=color.dtype)           # [T²]
+                T_acc = torch.ones(tile_flat.shape[0], device=color.device, dtype=color.dtype)  # [T²]
                 tile_color = torch.zeros(tile_flat.shape[0], 3, device=color.device, dtype=color.dtype)  # [T²×3]
                 for m, j in enumerate(idxs):
-                    a = alpha_tilde[m]                                                                   # [T²]
-                    c_j = color[j]                                                                       # [3]
-                    contrib = (a * T_acc).unsqueeze(-1) * c_j                                            # [T²×3]
+                    a = alpha_tilde[m]  # [T²]
+                    c_j = color[j]  # [3]
+                    contrib = (a * T_acc).unsqueeze(-1) * c_j  # [T²×3]
                     tile_color += contrib
                     T_acc = T_acc * (1.0 - a)
 
                 # Add white‐background residual
                 tile_color = tile_color + T_acc.unsqueeze(-1)
-                # ========================================================
 
                 render_color[h:h+self.tile_size,
                              w:w+self.tile_size
